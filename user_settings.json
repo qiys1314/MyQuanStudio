@@ -1,0 +1,10 @@
+{
+    "market": "创业板",
+    "recur_start": "2020-01-01",
+    "recur_end": "2026-05-14",
+    "recur_val": 2.0,
+    "price_period": "一年",
+    "price_pct": 20,
+    "vol_period": 5,
+    "vol_pct": 20
+}

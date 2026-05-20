@@ -1,0 +1,6 @@
+fastapi==0.103.2
+uvicorn==0.23.2
+pandas==2.0.3
+pydantic==2.4.2
+akshare>=1.1.15
+baostock>=0.8.8
