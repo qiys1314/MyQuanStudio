@@ -69,7 +69,11 @@ class CloudDataFetcher:
 
     @classmethod
     def update_kline(cls):
-        """K线原子化抓取：先入 temp_history_kline，成功后合并至 history_kline"""
+        """
+        更新历史 K 线数据。
+        采用增量同步策略与临时表原子化写入机制，确保数据一致性。
+        引入 kline_status 状态表以提升增量水位查询的性能。
+        """
         logging.info("🚀 [K线] 开始独立获取全市场通讯录并更新 K 线数据...")
         
         lg = bs.login()
@@ -78,9 +82,11 @@ class CloudDataFetcher:
             return
             
         try:
+            # 获取安全的 T-1 结算日
             safe_end_date = cls.get_safe_end_date()
             logging.info(f"📅 [K线] 更新目标安全结算日锁定为: {safe_end_date}")
 
+            # 获取全市场股票代码列表
             rs_stocks = bs.query_all_stock(day=safe_end_date)
             if rs_stocks.error_code != '0':
                 logging.error(f"❌ [K线] 获取通讯录失败: {rs_stocks.error_msg}")
@@ -89,6 +95,7 @@ class CloudDataFetcher:
             stock_df = rs_stocks.get_data()
             if stock_df.empty: return
 
+            # 过滤提取标准 A 股交易代码
             valid_codes = [
                 code.replace('sh.', '').replace('sz.', '') 
                 for code in stock_df['code'] 
@@ -99,7 +106,7 @@ class CloudDataFetcher:
             conn = sqlite3.connect(DB_HISTORY_PATH)
             cursor = conn.cursor()
             
-            # --- 原子化核心逻辑 1：构建主表与临时表 ---
+            # 定义主表与临时表的表结构规范
             table_schema = '''
                 (
                     日期 TEXT, 代码 TEXT, 开盘 REAL, 最高 REAL, 最低 REAL, 
@@ -108,34 +115,47 @@ class CloudDataFetcher:
                     PRIMARY KEY (日期, 代码) 
                 )
             '''
+            # 初始化主表与临时表
             cursor.execute(f"CREATE TABLE IF NOT EXISTS history_kline {table_schema}")
             cursor.execute(f"CREATE TABLE IF NOT EXISTS temp_history_kline {table_schema}")
-            # 每次运行前清空临时表，防止上一次崩溃残留脏数据
+            
+            # 初始化增量更新状态表，支撑毫秒级断点续传查询
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS kline_status (
+                    代码 TEXT PRIMARY KEY,
+                    最新日期 TEXT
+                )
+            ''')
+            
+            # 清空临时表数据，防止崩溃残留导致的脏读
             cursor.execute("DELETE FROM temp_history_kline")
             conn.commit()
 
-            # 基于主表计算高水位线
-            df_watermark = pd.read_sql("SELECT 代码, MAX(日期) as max_date FROM history_kline GROUP BY 代码", conn)
+            # 从状态表读取本地最新水位线数据字典，替代全表扫描
+            df_watermark = pd.read_sql("SELECT 代码, 最新日期 as max_date FROM kline_status", conn)
             watermark_dict = dict(zip(df_watermark['代码'], df_watermark['max_date']))
 
             total_inserted = 0
             updated_stocks = 0
 
-            # 遍历拉取数据
+            # 遍历并请求每只股票的增量切片
             for idx, code in enumerate(valid_codes, 1):
                 bs_code = f"sh.{code}" if code.startswith(('60', '68')) else f"sz.{code}"
 
+                # 判断拉取起点日期
                 if code in watermark_dict:
                     last_date = watermark_dict[code]
                     start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
                 else:
                     start_date = "2000-01-01" 
 
+                # 若起点大于安全截止日，判定为已最新，跳过当次拉取
                 if start_date > safe_end_date: continue
 
                 if idx % 200 == 0 or idx == 1:
                     logging.info(f"🌐 [K线] 正在推进: [{idx}/{len(valid_codes)}] 标的 {code}")
 
+                # 执行网络数据请求，包含防抖重试逻辑
                 rs = None
                 for attempt in range(3):
                     try:
@@ -152,12 +172,14 @@ class CloudDataFetcher:
                 
                 if rs is None or rs.error_code != '0': continue
 
+                # 提取返回结果
                 data_list = []
                 while (rs.error_code == '0') & rs.next():
                     data_list.append(rs.get_row_data())
 
                 if not data_list: continue 
                 
+                # 数据清洗与类型转换映射
                 df = pd.DataFrame(data_list, columns=rs.fields)
                 df.rename(columns={'date': '日期', 'code': '代码', 'open': '开盘', 'high': '最高', 'low': '最低', 'close': '收盘', 'preclose': '昨收', 'volume': '成交量', 'amount': '成交额', 'turn': '换手率', 'tradestatus': '状态'}, inplace=True)
                 
@@ -165,35 +187,45 @@ class CloudDataFetcher:
                 for c in num_cols: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
                 df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0).astype(int)
                 df['代码'] = df['代码'].str.replace('sh.', '').str.replace('sz.', '')
+                
+                # 滤除停牌及未产生成交的数据
                 df = df[(df['状态'] == '1') & (df['成交量'] > 0)] 
                 
                 if df.empty: continue
                 data_tuples = list(df.itertuples(index=False, name=None))
                 
                 try:
-                    # --- 原子化核心逻辑 2：仅写入临时表 ---
-                    # 此时主表 history_kline 完全不发生改变
+                    # 将清洗后的结构化增量数据批量写入临时表
                     cursor.executemany('''
                         INSERT OR IGNORE INTO temp_history_kline 
                         (日期, 代码, 开盘, 最高, 最低, 收盘, 昨收, 成交量, 成交额, 换手率, 状态) 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', data_tuples)
-                    conn.commit() # 临时表级别提交，防止内存溢出
+                    conn.commit() 
                     total_inserted += len(data_tuples)
                     updated_stocks += 1
                 except Exception as e:
                     logging.error(f"⚠️ [K线] 写入临时表 {code} 异常: {e}")
 
-            # --- 原子化核心逻辑 3：最终事务合并 ---
-            # 只有当上面的 for 循环全部跑完且没有发生全局性崩溃时，才执行合并
+            # 开启数据库原子化事务，执行主表合并及状态表批量更迭
             logging.info("⏳ [K线] 爬取结束，正在执行原子化主表合并...")
-            cursor.execute("BEGIN TRANSACTION;") # 开启独占事务
+            cursor.execute("BEGIN TRANSACTION;")
+            
+            # 第一阶段：将临时表暂存数据合入主历史表
             cursor.execute('''
                 INSERT OR REPLACE INTO history_kline 
                 SELECT * FROM temp_history_kline
             ''')
-            cursor.execute("DELETE FROM temp_history_kline") # 合并完立刻销毁沙盒数据
-            conn.commit() # 一次性将几万条增量数据落入主表
+            
+            # 第二阶段：提取临时表内各标的的最新日期，覆盖式写入状态表
+            cursor.execute('''
+                INSERT OR REPLACE INTO kline_status (代码, 最新日期)
+                SELECT 代码, MAX(日期) FROM temp_history_kline GROUP BY 代码
+            ''')
+            
+            # 第三阶段：清除临时沙盒缓存
+            cursor.execute("DELETE FROM temp_history_kline") 
+            conn.commit() 
 
             conn.close()
             logging.info(f"🎉 [K线] 战役结束! 为 {updated_stocks} 只股票无缝合入 {total_inserted} 行新数据。")
