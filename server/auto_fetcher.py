@@ -21,16 +21,17 @@ import baostock as bs
 # ==============================================================================
 # 1. 基础配置与日志引擎初始化
 # ==============================================================================
+# 动态将项目根目录加入系统环境变量，确保能顺利导入 utils 模块
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
+# 直接从项目的统一配置中心导入路径，实现端云同构
+from utils.config import DATA_DIR, DB_HISTORY_PATH, DB_FINANCE_PATH, DB_DIVIDEND_PATH
+
+# 独立定义服务端的日志目录
 LOG_DIR = os.path.join(BASE_DIR, "logs")
-
-os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
-
-DB_HISTORY_PATH = os.path.join(DATA_DIR, "history_kline.db")
-DB_FINANCE_PATH = os.path.join(DATA_DIR, "all_financials.db")
-DB_DIVIDEND_PATH = os.path.join(DATA_DIR, "dividend_rules.db")
 
 log_file = os.path.join(LOG_DIR, f"fetcher_{datetime.now().strftime('%Y%m%d')}.log")
 logging.basicConfig(
