@@ -28,7 +28,78 @@ from utils.config import DB_HISTORY_PATH
 # ------------------------------------------------------------------------------
 class SyncRequest(BaseModel):
     client_latest_date: str  # 客户端本地数据库的最新日期，格式要求为 YYYY-MM-DD
+    limit: int = 100000  # 强行限制单次最大下发条数，防止撑爆内存
+    offset: int = 0      # 分页偏移量
+    
+@app.post("/api/kline/sync")
+def get_incremental_data(request: SyncRequest):
+    """
+    接口功能：根据客户端提供的基准日期，分页提取增量 K 线数据。
+    """
+    if not os.path.exists(DB_HISTORY_PATH):
+        raise HTTPException(status_code=500, detail="服务端数据库文件未找到。")
 
+    # 【修复 1】服务端必须同样开启 WAL 模式和超时等待，否则会被 auto_fetcher 锁死
+    conn = sqlite3.connect(DB_HISTORY_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    
+    try:
+        cursor = conn.cursor()
+        # 【修复 2】先查出总数，发给客户端用于计算进度条
+        cursor.execute("SELECT COUNT(*) FROM history_kline WHERE 日期 > ?", (request.client_latest_date,))
+        total_count = cursor.fetchone()[0]
+        
+        if total_count == 0:
+            return {"status": "up_to_date", "data": [], "has_more": False, "total": 0}
+        
+        # 【修复 3】SQL 语句必须加上 LIMIT 和 OFFSET，实现真正的内存保护流控！
+        query = """
+            SELECT * FROM history_kline 
+            WHERE 日期 > ? 
+            ORDER BY 日期 ASC, 代码 ASC 
+            LIMIT ? OFFSET ?
+        """
+        df_incremental = pd.read_sql(query, conn, params=(
+            request.client_latest_date, request.limit, request.offset
+        ))
+        
+        records = df_incremental.to_dict(orient="records")
+        
+        # 判断是否还有剩余数据未发送
+        has_more = (request.offset + len(records)) < total_count
+        
+        return {
+            "status": "success",
+            "data": records,
+            "has_more": has_more,
+            "next_offset": request.offset + len(records),
+            "total": total_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"服务端数据提取异常: {str(e)}")
+    finally:
+        conn.close()
+
+# 顺手把上面的 watermark 接口也加上 WAL，防止查询水位时被锁死
+@app.get("/api/kline/watermark")
+def get_server_latest_date():
+    if not os.path.exists(DB_HISTORY_PATH):
+        raise HTTPException(status_code=500, detail="服务端数据库文件未找到。")
+    
+    conn = sqlite3.connect(DB_HISTORY_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(日期) FROM history_kline")
+        max_date = cursor.fetchone()[0]
+        
+        if max_date is None:
+            return {"latest_date": "1900-01-01", "message": "服务端数据库为空。"}
+        return {"latest_date": max_date}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"数据库查询异常: {str(e)}")
+    finally:
+        conn.close()
 # ------------------------------------------------------------------------------
 # API 路由接口定义
 # ------------------------------------------------------------------------------

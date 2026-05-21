@@ -744,55 +744,116 @@ class DataUpdateThread(QThread):
                 return
 
             # =================================================================
-            # 轨道 B：热启动（本地已有库 -> 触发 JSON 极速增量对比）
+            # 轨道 B：热启动（本地已有库 -> 触发 JSON 分批循环拉取与多层校验）
             # =================================================================
             local_max_date = DBManager.get_latest_kline_date()
-            self.log_signal.emit(f"📦 本地数据已至 {local_max_date}，正在向云端请求增量切片...")
+            if not local_max_date:
+                local_max_date = "2000-01-01"
+                
+            self.log_signal.emit(f"📦 本地数据已至 {local_max_date}，启动防 OOM 分批同步引擎...")
 
-            response = requests.post(
-                f"{server_url}/api/kline/sync",
-                json={"client_latest_date": local_max_date},
-                timeout=60
-            )
-            
-            if response.status_code != 200:
-                self.log_signal.emit(f"❌ 云端服务器异常，状态码: {response.status_code}")
-                return
-                
-            res_data = response.json()
-            
-            if res_data.get("status") == "up_to_date":
-                self.log_signal.emit("✅ 本地 K 线数据库已是最新，无需同步。")
-                return
-                
-            records = res_data.get("data", [])
-            count = res_data.get("count", 0)
-            
-            if not records:
-                self.log_signal.emit("✅ 云端暂时没有比本地更新的数据。")
-                return
-                
-            self.log_signal.emit(f"⬇️ 成功获取 {count} 条增量 K 线数据，正在执行高速本地入库...")
-            
-            df_incremental = pd.DataFrame(records)
-            data_tuples = list(df_incremental.itertuples(index=False, name=None))
-            
-            conn = sqlite3.connect(DB_HISTORY_PATH)
+            # 【核心优化 1】开启 SQLite 高并发 WAL 模式，彻底解决 Database is locked
+            conn = sqlite3.connect(DB_HISTORY_PATH, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
-            cursor.executemany('''
-                INSERT OR REPLACE INTO history_kline 
-                (日期, 代码, 开盘, 最高, 最低, 收盘, 昨收, 成交量, 成交额, 换手率, 状态) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', data_tuples)
-            conn.commit()
+
+            offset = 0
+            has_more = True
+            limit_size = 100000  # 每次最多拉取 10 万条，绝对保护本地内存
+            total_synced = 0
+
+            # 启动循环分页拉取
+            while has_more:
+                # 【核心防卡死】随时响应主界面的“中止/停止”按钮
+                if not self.is_running:
+                    self.log_signal.emit("🛑 收到用户指令，已安全中止增量数据云同步。")
+                    break
+
+                payload = {
+                    "client_latest_date": local_max_date,
+                    "limit": limit_size,
+                    "offset": offset
+                }
+
+                response = requests.post(
+                    f"{server_url}/api/kline/sync",
+                    json=payload,
+                    timeout=60
+                )
+                
+                if response.status_code != 200:
+                    self.log_signal.emit(f"❌ 云端服务器异常，状态码: {response.status_code}")
+                    break
+                    
+                res_data = response.json()
+                
+                # 状态判定
+                if res_data.get("status") == "up_to_date":
+                    if total_synced == 0:
+                        self.log_signal.emit("✅ 本地 K 线数据库已是最新，无需同步。")
+                    break
+                    
+                batch_data = res_data.get("data", [])
+                total_remote = res_data.get("total", 0)
+                
+                # 【防污染校验 1】数量对齐校验
+                if not batch_data or len(batch_data) == 0:
+                    break
+                    
+                # 【防污染校验 2】字段完整性抽查 (检查首条数据)
+                if '日期' not in batch_data[0] or '代码' not in batch_data[0]:
+                    self.log_signal.emit("❌ 拦截警报：收到云端残缺数据包，核心字段丢失！同步已终止。")
+                    break
+                
+                try:
+                    # 开启事务，保护每一批次的完整性
+                    cursor.execute("BEGIN TRANSACTION;")
+                    
+                    # 将 JSON 字典列表转为元组列表，并严格对齐数据库字段顺序
+                    data_tuples = [
+                        (r.get('日期'), r.get('代码'), r.get('开盘'), r.get('最高'), 
+                         r.get('最低'), r.get('收盘'), r.get('昨收'), r.get('成交量'), 
+                         r.get('成交额'), r.get('换手率'), r.get('状态')) 
+                        for r in batch_data
+                    ]
+                    
+                    # 【防污染校验 3】幂等性写入：REPLACE INTO 防重复覆盖
+                    cursor.executemany('''
+                        INSERT OR REPLACE INTO history_kline 
+                        (日期, 代码, 开盘, 最高, 最低, 收盘, 昨收, 成交量, 成交额, 换手率, 状态) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', data_tuples)
+                    
+                    # 当前批次落盘
+                    conn.commit()
+                    
+                    total_synced += len(batch_data)
+                    has_more = res_data.get("has_more", False)
+                    offset = res_data.get("next_offset", 0)
+                    
+                    # 联动更新进度条和日志
+                    if total_remote > 0:
+                        progress = int((offset / total_remote) * 100)
+                        self.progress_signal.emit(min(progress, 99)) # 留 1% 给最终完成
+                        self.log_signal.emit(f"⬇️ 成功落盘一包数据，条数: {len(batch_data)}，总进度: {offset}/{total_remote}")
+                        
+                except Exception as db_e:
+                    # 单批次写入崩溃，立即回滚，保护本地底座纯净
+                    cursor.execute("ROLLBACK;")
+                    self.log_signal.emit(f"❌ 本地批次入库异常，已回滚保护: {db_e}")
+                    break
+            
+            # 关闭高并发连接
             conn.close()
             
-            if self.is_running:
-                self.log_signal.emit("🎉 极速云同步完成！数据已无缝合并至本地底座。")
+            # 循环结束后的总结
+            if self.is_running and total_synced > 0:
+                self.progress_signal.emit(100)
+                self.log_signal.emit(f"🎉 极速云同步完成！共无缝合并 {total_synced} 条增量数据。")
                 
         except requests.exceptions.ConnectionError:
             self.log_signal.emit("❌ 无法连接到云端服务器，请检查服务端是否已启动或防火墙是否放行。")
         except requests.exceptions.Timeout:
             self.log_signal.emit("❌ 数据拉取超时，请检查网络连接。")
         except Exception as e:
-            self.log_signal.emit(f"❌ 云同步解析或入库失败: {e}")
+            self.log_signal.emit(f"❌ 云同步运行时发生致命异常: {e}")

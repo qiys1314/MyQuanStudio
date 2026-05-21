@@ -317,8 +317,18 @@ class MainWindow(QMainWindow):
 
         # 4.3 成交量位置比参数设定
         self.vol_period = QSpinBox(); self.vol_period.setRange(1, 30); self.vol_period.setValue(5); self.vol_period.setSuffix(" 天")
+        vol_combo_widget = QWidget()
+        vol_combo_layout = QHBoxLayout(vol_combo_widget)
+        vol_combo_layout.setContentsMargins(0, 0, 0, 0)  # 边距清零，保证严丝合缝
+        vol_combo_layout.setSpacing(6)                  # 天数框和文字的微调间距
+        vol_combo_layout.addWidget(self.vol_period)     # 塞入天数框
+        
+        lbl_avg_text = QLabel("平均值")
+        lbl_avg_text.setObjectName("SubDesc")           # 沿用系统自带的灰色小字样式
+        vol_combo_layout.addWidget(lbl_avg_text)        # 塞入固定标签
+        
         self.vol_spin = QSpinBox(); self.vol_spin.setRange(1, 1000); self.vol_spin.setValue(20); self.vol_spin.setSuffix(" %")
-        self.main_layout.addWidget(self.create_row_card("成交量位置比", "最近", self.vol_period, self.vol_spin))
+        self.main_layout.addWidget(self.create_row_card("成交量位置比", "最近", vol_combo_widget, self.vol_spin))
 
         # 5. 横排全局操作按钮组
         btn_layout = QHBoxLayout()
