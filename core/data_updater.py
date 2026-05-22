@@ -202,42 +202,40 @@ class DataUpdateThread(QThread):
             # =====================================================
 
             # --- 步骤 3: 检查辅助数据库 (财报与分红) 的最后更新时间 ---
-            # 定义内部函数：检查指定数据库的健康状态
-            def check_db_health(db_path, name, is_finance=True):
-                # 若数据库文件存在
+            def check_db_health(db_path, name):
                 if os.path.exists(db_path):
-                    # 获取文件最后修改时间戳（os.path.getmtime返回秒级时间戳）
-                    mtime = os.path.getmtime(db_path)
-                    # 计算最后更新时间距现在的天数
-                    days_ago = (datetime.now() - datetime.fromtimestamp(mtime)).days
-                    # 发送最后更新时间日志
-                    self.log_signal.emit(f"💰 {name}：最后更新于 {days_ago} 天前。")
-                    
-                    # 获取当前月份
-                    month = datetime.now().month
-                    # 区分财报/分红库，给出不同的更新建议
-                    if is_finance:
-                        # 4/8/10月是财报密集披露期（一季报/中报/三季报）
-                        if month in [4, 8, 10]:
-                            self.log_signal.emit(f"   👉 [建议] 当前为 {month}月 财报密集披露期，建议提升更新频率。")
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT config_value FROM system_info WHERE config_key = 'last_success_time'")
+                        row = cursor.fetchone()
+                        conn.close()
+                        
+                        if row:
+                            last_time_str = row[0]
+                            last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M:%S')
+                            days_ago = (datetime.now() - last_time).days
+                            self.log_signal.emit(f"💰 {name}：内部时间戳记录最后更新于 {last_time_str} ({days_ago} 天前)。")
                         else:
-                            # 其他月份为财报真空期，数据无需频繁更新
-                            self.log_signal.emit(f"   👉 [建议] 当前处于财报真空期，历史数据库安全可用。")
+                            self.log_signal.emit(f"💰 {name}：发现本地库，但无时间戳记录 (旧版数据)。")
+                            days_ago = 999
+                    except Exception as e:
+                        self.log_signal.emit(f"💰 {name}：时间戳读取异常 ({e})，表结构可能陈旧。")
+                        days_ago = 999
+                        
+                    # 给出纯提示性质的干预建议
+                    if days_ago > 3:
+                        self.log_signal.emit(f"   👉 [建议] 数据已滞后，建议点击右侧【⚙️ 手动更新数据】抓取最新版本。")
                     else:
-                        # 5/6/7月是除权实施旺季
-                        if month in [5, 6, 7]:
-                            self.log_signal.emit(f"   👉 [建议] 当前为除权实施旺季，建议定期更新以确保复权精度。")
-                        else:
-                            # 其他月份非密集除权期，数据安全
-                            self.log_signal.emit(f"   👉 [建议] 非密集除权期，复权规则库当前状态安全。")
+                        self.log_signal.emit(f"   👉 [状态] 数据基底健康，处于有效更新期内。")
                 else:
-                    # 数据库文件不存在，提示执行下载
-                    self.log_signal.emit(f"💰 {name}：未找到本地数据库，请执行下载。")
+                    self.log_signal.emit(f"💰 {name}：未找到本地数据库，请执行初始化下载。")
 
-            # 检查财报数据库健康状态
-            check_db_health(DB_FINANCE_PATH, "财报数据库", is_finance=True)
+            # 检查财报数据库健康状态 (不再需要 is_finance 参数区分月份，统一看天数)
+            check_db_health(DB_FINANCE_PATH, "财报数据库")
             # 检查分红数据库健康状态
-            check_db_health(DB_DIVIDEND_PATH, "分红除权数据库", is_finance=False)
+            check_db_health(DB_DIVIDEND_PATH, "分红除权数据库")
+            
 
             # 发送自检结束分隔符日志
             self.log_signal.emit("========================================================")
@@ -519,6 +517,12 @@ class DataUpdateThread(QThread):
                     PRIMARY KEY (代码, 报告期)
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_info (
+                    config_key TEXT PRIMARY KEY,
+                    config_value TEXT
+                )
+            ''')
             conn.commit()
 
             now = datetime.now()
@@ -586,6 +590,13 @@ class DataUpdateThread(QThread):
                     time.sleep(1.5)
                 except Exception:
                     continue
+            # 记录最新成功的时间戳，对齐云端逻辑    
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT OR REPLACE INTO system_info (config_key, config_value) 
+                VALUES ('last_success_time', ?)
+            ''', (current_time,))
+            conn.commit()
                         
             conn.close()
             if self.is_running:
@@ -607,6 +618,12 @@ class DataUpdateThread(QThread):
                     代码 TEXT NOT NULL, ex_date TEXT NOT NULL,
                     S REAL, D REAL,
                     PRIMARY KEY (代码, ex_date)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_info (
+                    config_key TEXT PRIMARY KEY,
+                    config_value TEXT
                 )
             ''')
             conn.commit()
@@ -693,6 +710,13 @@ class DataUpdateThread(QThread):
                     time.sleep(random.uniform(0.5, 1.5))
                 except Exception:
                     continue
+                
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT OR REPLACE INTO system_info (config_key, config_value) 
+                VALUES ('last_success_time', ?)
+            ''', (current_time,))
+            conn.commit()
             
             conn.close()
             if self.is_running:
@@ -869,10 +893,63 @@ class DataUpdateThread(QThread):
                 self.log_signal.emit(f"❌ 本地落盘入库异常，已回滚保护: {db_e}")
             finally:
                 conn_h.close()
+            # 定义一个内部闭包小函数，用于快速提取本地时间戳
+            def _get_local_ts(db_path):
+                if not os.path.exists(db_path): return "1900-01-01 00:00:00"
+                try:
+                    conn = sqlite3.connect(db_path)
+                    cur = conn.cursor()
+                    cur.execute("SELECT config_value FROM system_info WHERE config_key = 'last_success_time'")
+                    row = cur.fetchone()
+                    conn.close()
+                    return row[0] if row else "1900-01-01 00:00:00"
+                except: return "1900-01-01 00:00:00"
+
+            # 内部函数：通用物理文件拉取与逻辑判定
+            def _sync_aux_db(api_name, db_name, db_path):
+                self.log_signal.emit(f"☁️ 正在比对【{db_name}】云端版本...")
+                try:
+                    # 1. 探活获取云端时间戳
+                    res_status = requests.get(f"{server_url}/api/{api_name}/status", timeout=10)
+                    if res_status.status_code == 200 and res_status.json().get("status") == "success":
+                        t_server = res_status.json().get("last_update")
+                        t_local = _get_local_ts(db_path)
+                        
+                        server_time = datetime.strptime(t_server, '%Y-%m-%d %H:%M:%S')
+                        days_diff = (datetime.now() - server_time).days
+                        
+                        # 2. 核心拦截判定网
+                        if t_server > t_local:
+                            if days_diff < 3:
+                                self.log_signal.emit(f"⬇️ 发现云端新版本 ({t_server})，开始进行物理层覆盖...")
+                                with requests.get(f"{server_url}/api/{api_name}/download", stream=True, timeout=15) as r:
+                                    r.raise_for_status()
+                                    with open(db_path, 'wb') as f:
+                                        for chunk in r.iter_content(chunk_size=8192):
+                                            if chunk: f.write(chunk)
+                                self.log_signal.emit(f"🎉 {db_name} 极速下沉完毕！")
+                            else:
+                                self.log_signal.emit(f"⚠️ 云端【{db_name}】时间为 {t_server}，距今已超 3 天。")
+                                self.log_signal.emit(f"   👉 [系统建议] 服务器数据滞后，请采用上方菜单的【⚙️ 手动更新数据】功能。")
+                        else:
+                            self.log_signal.emit(f"✅ 本地【{db_name}】已是最新 (您的版本: {t_local})，无需拉取。")
+                    else:
+                        self.log_signal.emit(f"❌ 服务器暂未构建【{db_name}】底座，或接口离线。")
+                except Exception as e:
+                    self.log_signal.emit(f"❌ {db_name} 同步发生异常: {e}")
+
+            # 顺序执行财报和分红的同构逻辑
+            if self.is_running:
+                _sync_aux_db("finance", "财报数据库", DB_FINANCE_PATH)
+            if self.is_running:
+                _sync_aux_db("dividend", "分红数据库", DB_DIVIDEND_PATH)
                 
+            # ====== 👆 新增插入结束 👆 ======
+            
         # =====================================================================
         # 补全最外层的 except：拦截所有断网、超时等网络级或系统级错误
         # =====================================================================
+        
         except requests.exceptions.RequestException as req_e:
             self.log_signal.emit(f"❌ 网络请求失败，请检查服务器是否开启: {req_e}")
         except Exception as e:

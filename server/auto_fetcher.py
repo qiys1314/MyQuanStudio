@@ -236,12 +236,15 @@ class CloudDataFetcher:
 
     @classmethod
     def update_finance(cls):
-        """财务报表原子化抓取"""
+        """财务报表原子化抓取 (带系统打卡戳)"""
         logging.info("📊 [财报] 开始同步全市场财务报告数据...")
         try:
             conn = sqlite3.connect(DB_FINANCE_PATH)
             cursor = conn.cursor()
             
+            # ==========================================
+            # 阶段 1: 建立核心表、临时表与元数据表
+            # ==========================================
             table_schema = '''
                 (
                     代码 TEXT, 名称 TEXT, 每股收益 REAL, 每股净资产 REAL,
@@ -251,9 +254,19 @@ class CloudDataFetcher:
             '''
             cursor.execute(f"CREATE TABLE IF NOT EXISTS all_financials {table_schema}")
             cursor.execute(f"CREATE TABLE IF NOT EXISTS temp_all_financials {table_schema}")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_info (
+                    config_key TEXT PRIMARY KEY,
+                    config_value TEXT
+                )
+            ''')
+            # 每次启动前，务必清空临时表，防止上次崩溃残留
             cursor.execute("DELETE FROM temp_all_financials")
             conn.commit()
 
+            # ==========================================
+            # 阶段 2: 3年滑动窗口网络抓取 (只写临时表)
+            # ==========================================
             now = datetime.now()
             years = [now.year, now.year - 1, now.year - 2]
             periods = ["1231", "0930", "0630", "0331"]
@@ -301,26 +314,44 @@ class CloudDataFetcher:
                 except Exception as e:
                     logging.warning(f"⚠️ [财报] 季度 {r_date} 处理异常: {e}")
             
-            # 执行原子化合并
-            logging.info("⏳ [财报] 扫描完毕，执行原子化主表合并...")
+            # ==========================================
+            # 阶段 3: 原子化主表合并 + 盖上成功打卡戳
+            # ==========================================
+            logging.info("⏳ [财报] 扫描完毕，执行原子化主表合并与状态更新...")
             cursor.execute("BEGIN TRANSACTION;")
-            cursor.execute("INSERT OR REPLACE INTO all_financials SELECT * FROM temp_all_financials")
-            cursor.execute("DELETE FROM temp_all_financials")
-            conn.commit()
             
-            conn.close()
+            # 1. 覆盖进主库
+            cursor.execute("INSERT OR REPLACE INTO all_financials SELECT * FROM temp_all_financials")
+            # 2. 清理临时库
+            cursor.execute("DELETE FROM temp_all_financials")
+            
+            # 3. 记录最新成功的时间戳
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT OR REPLACE INTO system_info (config_key, config_value) 
+                VALUES ('last_success_time', ?)
+            ''', (current_time,))
+            
+            conn.commit()
             logging.info("🎉 [财报] 全市场业绩底座安全同步完毕！")
+            
         except Exception as e:
-            logging.error(f"❌ [财报] 核心逻辑崩溃: {e}")
+            # 发生异常回滚
+            logging.error(f"❌ [财报] 数据合并发生异常: {e}")
+        finally:
+            conn.close()
 
     @classmethod
     def update_dividend(cls):
-        """分红送配原子化抓取"""
+        """分红送配原子化抓取 (带系统打卡戳)"""
         logging.info("🎁 [分红] 启动分红送配除权引擎...")
         try:
             conn = sqlite3.connect(DB_DIVIDEND_PATH) 
             cursor = conn.cursor()
             
+            # ==========================================
+            # 阶段 1: 建立核心表、临时表与元数据表
+            # ==========================================
             table_schema = '''
                 (
                     代码 TEXT NOT NULL, ex_date TEXT NOT NULL,
@@ -330,9 +361,18 @@ class CloudDataFetcher:
             '''
             cursor.execute(f"CREATE TABLE IF NOT EXISTS dividend_rules {table_schema}")
             cursor.execute(f"CREATE TABLE IF NOT EXISTS temp_dividend_rules {table_schema}")
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_info (
+                    config_key TEXT PRIMARY KEY,
+                    config_value TEXT
+                )
+            ''')
             cursor.execute("DELETE FROM temp_dividend_rules")
             conn.commit()
 
+            # ==========================================
+            # 阶段 2: 扫描与网络请求 (只写临时表)
+            # ==========================================
             cursor.execute("SELECT MIN(ex_date) FROM dividend_rules")
             min_date = cursor.fetchone()[0]
             
@@ -402,17 +442,28 @@ class CloudDataFetcher:
                 except Exception:
                     continue
             
-            # 执行原子化合并
-            logging.info("⏳ [分红] 扫描完毕，执行原子化主表合并...")
+            # ==========================================
+            # 阶段 3: 原子化主表合并 + 盖上成功打卡戳
+            # ==========================================
+            logging.info("⏳ [分红] 扫描完毕，执行原子化主表合并与状态更新...")
             cursor.execute("BEGIN TRANSACTION;")
+            
             cursor.execute("INSERT OR REPLACE INTO dividend_rules SELECT * FROM temp_dividend_rules")
             cursor.execute("DELETE FROM temp_dividend_rules")
+            
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT OR REPLACE INTO system_info (config_key, config_value) 
+                VALUES ('last_success_time', ?)
+            ''', (current_time,))
+            
             conn.commit()
-
-            conn.close()
             logging.info(f"🎉 [分红] 除权引擎落地！本轮有效补充规则 {total_inserted} 条。")
+            
         except Exception as e:
             logging.error(f"❌ [分红] 网络链路或计算逻辑中断: {e}")
+        finally:
+            conn.close()
 
 # ==============================================================================
 # 程序启动主入口
