@@ -315,22 +315,38 @@ class CloudDataFetcher:
                     logging.warning(f"⚠️ [财报] 季度 {r_date} 处理异常: {e}")
             
             # ==========================================
-            # 阶段 3: 原子化主表合并 + 盖上成功打卡戳
+            # 阶段 3: 差异比对与按需写入
             # ==========================================
-            logging.info("⏳ [财报] 扫描完毕，执行原子化主表合并与状态更新...")
+            logging.info("⏳ [财报] 扫描完毕，正在进行数据变动差异化比对...")
             cursor.execute("BEGIN TRANSACTION;")
             
-            # 1. 覆盖进主库
-            cursor.execute("INSERT OR REPLACE INTO all_financials SELECT * FROM temp_all_financials")
-            # 2. 清理临时库
+            # 计算临时表与主表的实质性数据差异行数
+            cursor.execute('''
+                SELECT COUNT(*) FROM temp_all_financials t
+                LEFT JOIN all_financials a ON t.代码 = a.代码 AND t.报告期 = a.报告期
+                WHERE a.代码 IS NULL
+                   OR IFNULL(t.每股收益, 0) != IFNULL(a.每股收益, 0)
+                   OR IFNULL(t.净利润, 0) != IFNULL(a.净利润, 0)
+            ''')
+            real_mutations = cursor.fetchone()[0]
+            
+            # ====== 【优化】按需落盘机制 ======
+            if real_mutations > 0:
+                # 仅当检测到变动时，才执行覆盖主表的磁盘写入操作
+                cursor.execute("INSERT OR REPLACE INTO all_financials SELECT * FROM temp_all_financials")
+                # 更新变动时间戳记录
+                mutation_date = datetime.now().strftime('%Y-%m-%d')
+                cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('last_mutation_date', ?)", (mutation_date,))
+                logging.info(f"💡 [财报] 检测到 {real_mutations} 行实质性变动，数据已写入主表，变动戳更新至 {mutation_date}")
+            else:
+                logging.info("🤷‍♂️ [财报] 抓取数据与本地完全一致，跳过主表覆盖操作，变动戳保持不变。")
+            
+            # 无论是否发生变动，均需清理临时表空间
             cursor.execute("DELETE FROM temp_all_financials")
             
-            # 3. 记录最新成功的时间戳
+            # 更新最后一次任务成功运行的时间记录
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            cursor.execute('''
-                INSERT OR REPLACE INTO system_info (config_key, config_value) 
-                VALUES ('last_success_time', ?)
-            ''', (current_time,))
+            cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('last_success_time', ?)", (current_time,))
             
             conn.commit()
             logging.info("🎉 [财报] 全市场业绩底座安全同步完毕！")
@@ -373,13 +389,16 @@ class CloudDataFetcher:
             # ==========================================
             # 阶段 2: 扫描与网络请求 (只写临时表)
             # ==========================================
-            cursor.execute("SELECT MIN(ex_date) FROM dividend_rules")
-            min_date = cursor.fetchone()[0]
+            # 先去数据库里查有没有盖过“全量拉取”的印章，并定义 is_full_init
+            cursor.execute("SELECT config_value FROM system_info WHERE config_key = 'dividend_full_init'")
+            init_row = cursor.fetchone()
+            is_full_init = True if init_row and init_row[0] == '1' else False
             
             now = datetime.now()
             scan_periods = []
             
-            if not min_date or min_date > "2006-01-01":
+            # 使用刚才定义的 is_full_init 来做判断
+            if not is_full_init:
                 logging.info("⚠️ [分红] 触发底座全量自愈机制 (耗时较长)...")
                 start_year = 2000  
                 for y in range(now.year, start_year - 1, -1):
@@ -443,19 +462,38 @@ class CloudDataFetcher:
                     continue
             
             # ==========================================
-            # 阶段 3: 原子化主表合并 + 盖上成功打卡戳
+            # 阶段 3: 差异比对与按需写入
             # ==========================================
-            logging.info("⏳ [分红] 扫描完毕，执行原子化主表合并与状态更新...")
+            logging.info("⏳ [财报] 扫描完毕，正在进行数据变动差异化比对...")
             cursor.execute("BEGIN TRANSACTION;")
             
-            cursor.execute("INSERT OR REPLACE INTO dividend_rules SELECT * FROM temp_dividend_rules")
-            cursor.execute("DELETE FROM temp_dividend_rules")
-            
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # 计算临时表与主表的实质性数据差异行数
             cursor.execute('''
-                INSERT OR REPLACE INTO system_info (config_key, config_value) 
-                VALUES ('last_success_time', ?)
-            ''', (current_time,))
+                SELECT COUNT(*) FROM temp_all_financials t
+                LEFT JOIN all_financials a ON t.代码 = a.代码 AND t.报告期 = a.报告期
+                WHERE a.代码 IS NULL
+                   OR IFNULL(t.每股收益, 0) != IFNULL(a.每股收益, 0)
+                   OR IFNULL(t.净利润, 0) != IFNULL(a.净利润, 0)
+            ''')
+            real_mutations = cursor.fetchone()[0]
+            
+            # ====== 【优化】按需落盘机制 ======
+            if real_mutations > 0:
+                # 仅当检测到变动时，才执行覆盖主表的磁盘写入操作
+                cursor.execute("INSERT OR REPLACE INTO all_financials SELECT * FROM temp_all_financials")
+                # 更新变动时间戳记录
+                mutation_date = datetime.now().strftime('%Y-%m-%d')
+                cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('last_mutation_date', ?)", (mutation_date,))
+                logging.info(f"💡 [财报] 检测到 {real_mutations} 行实质性变动，数据已写入主表，变动戳更新至 {mutation_date}")
+            else:
+                logging.info("🤷‍♂️ [财报] 抓取数据与本地完全一致，跳过主表覆盖操作，变动戳保持不变。")
+            
+            # 无论是否发生变动，均需清理临时表空间
+            cursor.execute("DELETE FROM temp_all_financials")
+            
+            # 更新最后一次任务成功运行的时间记录
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('last_success_time', ?)", (current_time,))
             
             conn.commit()
             logging.info(f"🎉 [分红] 除权引擎落地！本轮有效补充规则 {total_inserted} 条。")

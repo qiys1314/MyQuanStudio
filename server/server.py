@@ -62,8 +62,7 @@ def get_server_latest_date():
 @app.post("/api/kline/sync")
 def get_incremental_data(request: SyncRequest):
     """
-    基于客户端字典的高效增量切片下发接口。
-    对比客户端与服务端的日期差异，返回缺失的 K 线数据记录集。
+    基于客户端字典的高效增量切片下发接口。(副表对决优化版)
     """
     if not os.path.exists(DB_HISTORY_PATH):
         raise HTTPException(status_code=500, detail="服务端数据库文件未找到。")
@@ -72,35 +71,70 @@ def get_incremental_data(request: SyncRequest):
     conn.execute("PRAGMA journal_mode=WAL;")
     
     try:
-        watermarks = request.watermark_dict
+        client_watermarks = request.watermark_dict
         
-        if not watermarks:
+        if not client_watermarks:
             return {"status": "success", "data": [], "message": "客户端副表为空，请走冷启动全量下载。"}
-            
-        # 计算客户端全市场中最旧的日期，以减少 SQL 初次查询的数据量
-        min_date = min(watermarks.values())
-        
-        query = "SELECT * FROM history_kline WHERE 日期 > ?"
-        df = pd.read_sql(query, conn, params=(min_date,))
-        
-        if df.empty:
+
+        # =====================================================================
+        # 步骤 1: 提取服务端的副表 (耗时不到 0.05 秒)
+        # =====================================================================
+        df_server_status = pd.read_sql("SELECT 代码, 最新日期 FROM kline_status", conn)
+        server_watermarks = dict(zip(df_server_status['代码'], df_server_status['最新日期']))
+
+        # =====================================================================
+        # 步骤 2: 纯内存字典精准比对，找出真正落后的股票
+        # =====================================================================
+        needs_update = {}
+        for code, client_date in client_watermarks.items():
+            server_date = server_watermarks.get(code)
+            # 只有当服务端有这只股票，且服务端的日期确实大于客户端时，才需要提取增量
+            if server_date and server_date > client_date:
+                needs_update[code] = client_date
+
+        # 如果比对后发现没有任何股票需要更新，直接极速返回！(这就是解决 13 秒空转的核心)
+        if not needs_update:
             return {"status": "up_to_date", "data": []}
-            
-        # 映射客户端每只股票的最大日期，并过滤出服务端多出的新数据
-        df['client_max_date'] = df['代码'].map(watermarks).fillna('2000-01-01')
-        df_sliced = df[df['日期'] > df['client_max_date']]
+
+        # =====================================================================
+        # 步骤 3: 按需精准切片 (日期分组 + 分块查询，防止 SQL 语句过长爆表)
+        # =====================================================================
+        results = []
         
-        if df_sliced.empty:
-            return {"status": "up_to_date", "data": []}
-            
-        df_sliced = df_sliced.drop(columns=['client_max_date'])
-        records = df_sliced.to_dict(orient="records")
-        
+        # 将相同起始日期的股票分在一组，极大减少 SQL 查询次数
+        # 比如：4000 只股票都是差昨天一天的数据，那就组合成一条 SQL 查出来
+        from collections import defaultdict
+        date_groups = defaultdict(list)
+        for code, date in needs_update.items():
+            date_groups[date].append(code)
+
+        for c_date, codes in date_groups.items():
+            # SQLite 的 IN (...) 语法有 999 个变量的上限限制
+            # 我们按照 800 个一批进行安全切块 (Chunking)
+            chunk_size = 800
+            for i in range(0, len(codes), chunk_size):
+                chunk_codes = codes[i : i + chunk_size]
+                
+                # 动态拼接占位符: (?, ?, ?, ...)
+                placeholders = ','.join(['?'] * len(chunk_codes))
+                query = f"SELECT * FROM history_kline WHERE 日期 > ? AND 代码 IN ({placeholders})"
+                
+                # 参数组装: [日期, 代码1, 代码2, ...]
+                params = [c_date] + chunk_codes
+                
+                df_chunk = pd.read_sql(query, conn, params=params)
+                if not df_chunk.empty:
+                    results.extend(df_chunk.to_dict(orient="records"))
+
+        if not results:
+             return {"status": "up_to_date", "data": []}
+
         return {
             "status": "success",
-            "data": records,
-            "total_synced": len(records)
+            "data": results,
+            "total_synced": len(results)
         }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"服务端精准切片异常: {str(e)}")
     finally:
@@ -129,27 +163,43 @@ def download_full_db():
 def get_finance_status():
     """
     财报库状态探活接口。
-    读取系统元数据表（system_info）中绑定的最后一次成功写入时间戳。
+    同时读取【最后成功打卡时间】和【最后数据变动日期】。
     """
     if not os.path.exists(DB_FINANCE_PATH):
+        # 如果底层数据库不存在，返回错误信息
         return {"status": "error", "message": "云端财报库未建立"}
         
     try:
+        # 连接财报数据库，设置10秒超时防止锁死
         conn = sqlite3.connect(DB_FINANCE_PATH, timeout=10.0)
         cursor = conn.cursor()
         
+        # 查询原有的系统打卡时间戳
         cursor.execute("SELECT config_value FROM system_info WHERE config_key = 'last_success_time'")
-        row = cursor.fetchone()
+        # 获取查询结果的第一行
+        row_success = cursor.fetchone()
+        
+        # 查询新增的【数据库变动时间戳】（精确到天）
+        cursor.execute("SELECT config_value FROM system_info WHERE config_key = 'last_mutation_date'")
+        # 获取查询结果的第一行
+        row_mutation = cursor.fetchone()
+        
+        # 安全关闭数据库连接
         conn.close()
         
-        if row:
-            return {"status": "success", "last_update": row[0]}
-        else:
-            return {"status": "error", "message": "元数据表中无时间戳记录，判定为未完整初始化"}
+        # 组装返回的 JSON 数据包
+        return {
+            "status": "success", 
+            # 如果查到打卡时间则返回，否则返回默认的远古时间
+            "last_update": row_success[0] if row_success else "1900-01-01 00:00:00",
+            # 如果查到实质变动日期则返回，否则返回默认的远古日期
+            "last_mutation_date": row_mutation[0] if row_mutation else "1900-01-01"
+        }
             
     except Exception as e:
+        # 捕获任何异常，并打包在 JSON 中返回给客户端
         return {"status": "error", "message": f"财报状态查询异常: {str(e)}"}
-
+    
 @app.get("/api/finance/download")
 def download_finance_db():
     """
@@ -167,27 +217,39 @@ def download_finance_db():
 def get_dividend_status():
     """
     分红库状态探活接口。
-    读取系统元数据表（system_info）中绑定的最后一次成功写入时间戳。
+    逻辑同上，同时读取打卡时间与实质变动日期。
     """
     if not os.path.exists(DB_DIVIDEND_PATH):
+        # 如果底层数据库不存在，返回错误状态
         return {"status": "error", "message": "云端分红库未建立"}
         
     try:
+        # 连接分红数据库
         conn = sqlite3.connect(DB_DIVIDEND_PATH, timeout=10.0)
         cursor = conn.cursor()
         
+        # 提取系统正常跑完的打卡时间
         cursor.execute("SELECT config_value FROM system_info WHERE config_key = 'last_success_time'")
-        row = cursor.fetchone()
+        row_success = cursor.fetchone()
+        
+        # 提取数据真正发生物理变动的日期戳
+        cursor.execute("SELECT config_value FROM system_info WHERE config_key = 'last_mutation_date'")
+        row_mutation = cursor.fetchone()
+        
+        # 安全断开连接
         conn.close()
         
-        if row:
-            return {"status": "success", "last_update": row[0]}
-        else:
-            return {"status": "error", "message": "元数据表中无时间戳记录，判定为未完整初始化"}
+        # 组装并向客户端返回包含双时间戳的 JSON 数据包
+        return {
+            "status": "success", 
+            "last_update": row_success[0] if row_success else "1900-01-01 00:00:00",
+            "last_mutation_date": row_mutation[0] if row_mutation else "1900-01-01"
+        }
             
     except Exception as e:
+        # 容灾处理：将异常原因装入标准 JSON 格式返回
         return {"status": "error", "message": f"分红状态查询异常: {str(e)}"}
-
+    
 @app.get("/api/dividend/download")
 def download_dividend_db():
     """
