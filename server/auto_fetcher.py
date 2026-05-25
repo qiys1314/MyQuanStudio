@@ -136,8 +136,10 @@ class CloudDataFetcher:
             df_watermark = pd.read_sql("SELECT 代码, 最新日期 as max_date FROM kline_status", conn)
             watermark_dict = dict(zip(df_watermark['代码'], df_watermark['max_date']))
 
-            total_inserted = 0
-            updated_stocks = 0
+            # 定义各类计数器
+            total_inserted = 0     # 记录总共插入的数据行数
+            updated_stocks = 0     # 记录发生实质更新的股票数量
+            skipped_stocks = 0     # 记录因数据已是最新而跳过的股票数量
 
             # 遍历并请求每只股票的增量切片
             for idx, code in enumerate(valid_codes, 1):
@@ -151,10 +153,13 @@ class CloudDataFetcher:
                     start_date = "2000-01-01" 
 
                 # 若起点大于安全截止日，判定为已最新，跳过当次拉取
-                if start_date > safe_end_date: continue
+                if start_date > safe_end_date: 
+                    skipped_stocks += 1    # 增加跳过计数
+                    continue
 
-                if idx % 200 == 0 or idx == 1:
-                    logging.info(f"🌐 [K线] 正在推进: [{idx}/{len(valid_codes)}] 标的 {code}")
+                # 仅在实际发生下载时，打印进度
+                if updated_stocks % 200 == 0 or updated_stocks == 0:
+                    logging.info(f"🌐 [K线] 正在获取数据: 进度 [{idx}/{len(valid_codes)}] 标的 {code}")
 
                 # 执行网络数据请求，包含防抖重试逻辑
                 rs = None
@@ -208,25 +213,32 @@ class CloudDataFetcher:
                 except Exception as e:
                     logging.error(f"⚠️ [K线] 写入临时表 {code} 异常: {e}")
 
-            # 开启数据库原子化事务，执行主表合并及状态表批量更迭
-            logging.info("⏳ [K线] 爬取结束，正在执行原子化主表合并...")
-            cursor.execute("BEGIN TRANSACTION;")
-            
-            # 第一阶段：将临时表暂存数据合入主历史表
-            cursor.execute('''
-                INSERT OR REPLACE INTO history_kline 
-                SELECT * FROM temp_history_kline
-            ''')
-            
-            # 第二阶段：提取临时表内各标的的最新日期，覆盖式写入状态表
-            cursor.execute('''
-                INSERT OR REPLACE INTO kline_status (代码, 最新日期)
-                SELECT 代码, MAX(日期) FROM temp_history_kline GROUP BY 代码
-            ''')
-            
-            # 第三阶段：清除临时沙盒缓存
-            cursor.execute("DELETE FROM temp_history_kline") 
-            conn.commit() 
+            # 遍历结束，根据实际插入的行数决定是否执行主表合并
+            if total_inserted > 0:
+                # 开启数据库事务，执行临时表到主表的合并
+                logging.info("⏳ [K线] 数据下载完毕，开始执行临时表到主表的合并操作。")
+                cursor.execute("BEGIN TRANSACTION;")
+                
+                # 第一阶段：将临时表暂存数据合入主历史表
+                cursor.execute('''
+                    INSERT OR REPLACE INTO history_kline 
+                    SELECT * FROM temp_history_kline
+                ''')
+                
+                # 第二阶段：提取临时表内各标的的最新日期，覆盖式写入状态表
+                cursor.execute('''
+                    INSERT OR REPLACE INTO kline_status (代码, 最新日期)
+                    SELECT 代码, MAX(日期) FROM temp_history_kline GROUP BY 代码
+                ''')
+                
+                # 第三阶段：清除临时表缓存
+                cursor.execute("DELETE FROM temp_history_kline") 
+                conn.commit() 
+
+                logging.info(f"✅ [K线] 更新任务完成。共计为 {updated_stocks} 只股票写入 {total_inserted} 行增量数据。")
+            else:
+                # 若未插入任何新数据，直接打印跳过信息，不执行后续的合并操作
+                logging.info(f"✅ [K线] 数据验证完毕。本地 {skipped_stocks} 只股票均已更新至 {safe_end_date}，无需重复下载。")
 
             conn.close()
             logging.info(f"🎉 [K线] 战役结束! 为 {updated_stocks} 只股票无缝合入 {total_inserted} 行新数据。")
