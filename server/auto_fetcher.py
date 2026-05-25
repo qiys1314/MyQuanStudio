@@ -512,7 +512,7 @@ class CloudDataFetcher:
                 cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('dividend_full_init', '1')")
                 
             conn.commit()
-            logging.info(f"🎉 [分红] 除权引擎落地！本轮有效补充规则 {total_inserted} 条。")
+            logging.info(f"🎉 [分红] 数据验证完成！本次任务共扫描并校验了近期实施规则 {total_inserted} 条。")
             
         except Exception as e:
             logging.error(f"❌ [分红] 网络链路或计算逻辑中断: {e}")
