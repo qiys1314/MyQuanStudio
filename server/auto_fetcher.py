@@ -462,39 +462,43 @@ class CloudDataFetcher:
                     continue
             
             # ==========================================
-            # 阶段 3: 差异比对与按需写入
+            # 阶段 3: 差异比对与按需写入 (替换为以下正确的分红逻辑)
             # ==========================================
-            logging.info("⏳ [财报] 扫描完毕，正在进行数据变动差异化比对...")
+            logging.info("⏳ [分红] 扫描完毕，正在进行规则变动比对...")
             cursor.execute("BEGIN TRANSACTION;")
             
-            # 计算临时表与主表的实质性数据差异行数
+            # 计算存在差异的除权记录行数 (使用分红的临时表)
             cursor.execute('''
-                SELECT COUNT(*) FROM temp_all_financials t
-                LEFT JOIN all_financials a ON t.代码 = a.代码 AND t.报告期 = a.报告期
+                SELECT COUNT(*) FROM temp_dividend_rules t
+                LEFT JOIN dividend_rules a ON t.代码 = a.代码 AND t.ex_date = a.ex_date
                 WHERE a.代码 IS NULL
-                   OR IFNULL(t.每股收益, 0) != IFNULL(a.每股收益, 0)
-                   OR IFNULL(t.净利润, 0) != IFNULL(a.净利润, 0)
+                   OR IFNULL(t.S, 0) != IFNULL(a.S, 0)
+                   OR IFNULL(t.D, 0) != IFNULL(a.D, 0)
             ''')
             real_mutations = cursor.fetchone()[0]
             
-            # ====== 【优化】按需落盘机制 ======
+            # ====== 按需落盘机制 ======
             if real_mutations > 0:
-                # 仅当检测到变动时，才执行覆盖主表的磁盘写入操作
-                cursor.execute("INSERT OR REPLACE INTO all_financials SELECT * FROM temp_all_financials")
-                # 更新变动时间戳记录
+                # 仅在发生实际规则变动时，执行主表数据覆盖
+                cursor.execute("INSERT OR REPLACE INTO dividend_rules SELECT * FROM temp_dividend_rules")
+                # 记录变动发生日期
                 mutation_date = datetime.now().strftime('%Y-%m-%d')
                 cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('last_mutation_date', ?)", (mutation_date,))
-                logging.info(f"💡 [财报] 检测到 {real_mutations} 行实质性变动，数据已写入主表，变动戳更新至 {mutation_date}")
+                logging.info(f"💡 [分红] 检测到 {real_mutations} 条新规则，已写入主表，变动戳更新至 {mutation_date}")
             else:
-                logging.info("🤷‍♂️ [财报] 抓取数据与本地完全一致，跳过主表覆盖操作，变动戳保持不变。")
+                logging.info("🤷‍♂️ [分红] 未检测到新规则，跳过主表写入操作，变动戳保持不变。")
             
-            # 无论是否发生变动，均需清理临时表空间
-            cursor.execute("DELETE FROM temp_all_financials")
+            # 清理临时表记录
+            cursor.execute("DELETE FROM temp_dividend_rules")
             
-            # 更新最后一次任务成功运行的时间记录
+            # 记录任务成功运行的时间点
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('last_success_time', ?)", (current_time,))
             
+            # 更新全量初始化状态标识（印章在这里盖下！）
+            if not is_full_init and total_inserted > 0:
+                cursor.execute("INSERT OR REPLACE INTO system_info (config_key, config_value) VALUES ('dividend_full_init', '1')")
+                
             conn.commit()
             logging.info(f"🎉 [分红] 除权引擎落地！本轮有效补充规则 {total_inserted} 条。")
             
