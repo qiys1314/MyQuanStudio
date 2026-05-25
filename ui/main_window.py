@@ -353,8 +353,11 @@ class MainWindow(QMainWindow):
         self.btn_ok = QPushButton("🚀 启动筛选"); self.btn_ok.setObjectName("PrimaryBtn") 
         self.btn_clear = QPushButton("🗑️ 清空显示")
         
+        #5.4 打开本地导出目录按钮：实例化按钮对象
+        self.btn_open_dir = QPushButton("📁 筛选结果目录")
+        
         # 将新层级的按钮按序加入布局
-        for b in [self.btn_sync, self.btn_manual_update, self.btn_ok, self.btn_clear]: 
+        for b in [self.btn_sync, self.btn_manual_update, self.btn_ok, self.btn_clear, self.btn_open_dir]: 
             btn_layout.addWidget(b)
             
         self.main_layout.addLayout(btn_layout)
@@ -409,6 +412,8 @@ class MainWindow(QMainWindow):
         
         self.btn_ok.clicked.connect(self.start_calc_task) 
         self.btn_clear.clicked.connect(self.on_clear_or_abort_clicked)
+        # 将打开目录按钮的点击信号连接到新声明的类成员方法上
+        self.btn_open_dir.clicked.connect(self.open_export_dir)
         # =============================================================
         
         # 安全性设定：当用户修改起点日期后，将终点日历的最小值设为起点（阻止选择比起点早的日子）
@@ -561,7 +566,7 @@ class MainWindow(QMainWindow):
         self.is_task_running = not enabled # 更新全局任务状态标志
         
         # 锁定或解锁除了“清空”以外的业务触发按钮
-        for b in [self.btn_sync, self.btn_manual_update, self.btn_ok]:
+        for b in [self.btn_sync, self.btn_manual_update, self.btn_ok, self.btn_open_dir]:
             b.setEnabled(enabled)
             
         # 根据系统运行状态，智能切换最后一个按钮的作用
@@ -840,4 +845,19 @@ class MainWindow(QMainWindow):
         else:
             # 处于空闲状态，完全放行正常的应用关闭
             event.accept()
+    
+    def open_export_dir(self):
+        """
+        [业务方法] 调起本地操作系统资源管理器直接打开 Excel 筛选报告输出目录。
+        """
+        try:
+            # 检验并确保目标导出文件夹在物理磁盘上确实存在，若不存在则递归建立
+            os.makedirs(EXPORT_DIR, exist_ok=True)
+            # 调用 Windows 操作系统级接口，使用关联的资源管理器程序原生打开该绝对路径
+            os.startfile(EXPORT_DIR)
+            # 在软件下方的文本框中记录本次操作日志
+            self.log_info(f"📂 已成功调起系统资源管理器打开本地目录: {EXPORT_DIR}")
+        except Exception as e:
+            # 捕获由于系统权限不足或链路阻断导致的异常，防止主线程崩溃
+            self.log_info(f"❌ 调起本地导出目录失败，原因: {e}")
     # ==========================================================

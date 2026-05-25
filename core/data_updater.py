@@ -49,56 +49,83 @@ class DataUpdateThread(QThread):
         self.is_running = True
         
     @staticmethod
-    def get_safe_end_date():
+    def get_safe_end_date(log_callback=None):
         """
-        [公共方法] 测算安全的 T-1 结算基准日（零网络延迟，纯本地 SQL 毫秒级查询）
-        不再依赖 Baostock 登录，直接读取本地 trade_calendar 表。
+        [公共方法] 测算安全的 T-1 结算基准日（附带日历底座自动自愈功能）
         """
-        now = datetime.now()
+        from datetime import datetime, timedelta
+        import sqlite3
         
-        # 核心逻辑：以每天下午 18:00 为数据结算分界线
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+        current_year = now.year
+        
+        # 定义需要保障的日历最远边界（今年年底）
+        target_calendar_end = f"{current_year}-12-31"
+        
+        # 建立数据库连接并确保表存在
+        conn = sqlite3.connect(DB_HISTORY_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_calendar (
+                calendar_date TEXT PRIMARY KEY,
+                is_trading_day INTEGER
+            )
+        ''')
+        
+        # 1. 探针：检查本地日历的最高水位线
+        cursor.execute("SELECT MAX(calendar_date) FROM trade_calendar")
+        max_date_row = cursor.fetchone()
+        local_max_date = max_date_row[0] if max_date_row and max_date_row[0] else "1999-12-31"
+        
+        # 2. 自愈机制：如果本地最大日期连今天都没覆盖到，触发静默更新
+        if local_max_date < today_str:
+            if log_callback:
+                log_callback("⚠️ 检测到本地交易日历缺失或已过期，正在自动获取...")
+            
+            # 👇 【极限优化】：只有进到了这个需要联网的分支，才把沉重的 baostock 唤醒！
+            import baostock as bs
+            
+            if local_max_date != "1999-12-31":
+                start_date = (datetime.strptime(local_max_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+            else:
+                start_date = "2000-01-01"
+                
+            bs.login()
+            rs = bs.query_trade_dates(start_date=start_date, end_date=target_calendar_end)
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                row = rs.get_row_data()
+                data_list.append((row[0], int(row[1])))
+            bs.logout()
+            
+            # 将新日历写入本地
+            if data_list:
+                cursor.executemany('''
+                    INSERT OR REPLACE INTO trade_calendar (calendar_date, is_trading_day)
+                    VALUES (?, ?)
+                ''', data_list)
+                conn.commit()
+                if log_callback:
+                    log_callback(f"🎉 日历自愈完成！已自动覆盖至 {target_calendar_end}。")
+
+        # 3. 极速本地查询：此时日历绝对是完整且健康的
         if now.hour >= 18:
-            # 如果过了 18 点，说明今天的 K 线数据已经生成了。
-            # 我们就把“今天”作为向回查找的极限锚点。
-            target_limit = now.strftime('%Y-%m-%d')
+            target_limit = today_str
         else:
-            # 如果还没到 18 点，就算今天是交易日，数据也是没结算完的残缺品。
-            # 所以我们把“昨天”作为向回查找的极限锚点。
             target_limit = (now - timedelta(days=1)).strftime('%Y-%m-%d')
 
-        safe_end_date = "未知"
+        cursor.execute('''
+            SELECT MAX(calendar_date) 
+            FROM trade_calendar 
+            WHERE calendar_date <= ? AND is_trading_day = 1
+        ''', (target_limit,))
         
-        # 拦截：如果底层数据库文件还不存在（极早期冷启动），直接返回未知
-        if not os.path.exists(DB_HISTORY_PATH):
-            return safe_end_date
-
-        try:
-            # 连接本地历史数据库
-            conn = sqlite3.connect(DB_HISTORY_PATH)
-            cursor = conn.cursor()
-            
-            # 【极致 SQL 魔法】：查出所有小于等于 target_limit 的日期中，
-            # 且 is_trading_day = 1 (是交易日) 的【最大日期】
-            # 无论前面连着多少个周末、国庆、春节，这句 SQL 都能瞬间穿透，精确定位到上一个开盘日
-            cursor.execute('''
-                SELECT MAX(calendar_date) 
-                FROM trade_calendar 
-                WHERE calendar_date <= ? AND is_trading_day = 1
-            ''', (target_limit,))
-            
-            result = cursor.fetchone()
-            if result and result[0]:
-                safe_end_date = result[0]
-                
-        except Exception as e:
-            # 捕获异常（比如用户还没跑 init_calendar.py 导致找不到表）
-            print(f"本地日历查询异常，请确保已运行日历初始化脚本: {e}")
-        finally:
-            if 'conn' in locals():
-                conn.close()
-                
+        result = cursor.fetchone()
+        safe_end_date = result[0] if result and result[0] else "未知"
+        
+        conn.close()
         return safe_end_date
-    
     def run(self):
         """线程主执行函数：QThread启动后自动执行此方法"""
         try:
