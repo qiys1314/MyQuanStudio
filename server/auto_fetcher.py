@@ -113,7 +113,7 @@ class CloudDataFetcher:
                     日期 TEXT, 代码 TEXT, 开盘 REAL, 最高 REAL, 最低 REAL, 
                     收盘 REAL, 昨收 REAL, 成交量 INTEGER, 成交额 REAL, 
                     换手率 REAL, 状态 TEXT,
-                    PRIMARY KEY (日期, 代码) 
+                    PRIMARY KEY (代码, 日期) 
                 )
             '''
             # 初始化主表与临时表

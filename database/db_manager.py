@@ -30,7 +30,7 @@ class DBManager:
         conn_h.execute('''CREATE TABLE IF NOT EXISTS history_kline (
             日期 TEXT, 代码 TEXT, 开盘 REAL, 最高 REAL, 最低 REAL, 收盘 REAL, 
             昨收 REAL, 成交量 INTEGER, 成交额 REAL, 换手率 REAL, 状态 TEXT,
-            PRIMARY KEY (日期, 代码))''')
+            PRIMARY KEY (代码, 日期))''')
         # 关闭连接，释放文件锁
         conn_h.close()
 
@@ -63,7 +63,7 @@ class DBManager:
         try:
             # 聚合查询 MAX(日期)。由于日期是 YYYY-MM-DD 格式，字符串比较可以正确找出最晚的日期。
             # .fetchone() 返回包含单行数据的元组，[0] 用于提取元组中的第一个值（即具体日期字符串）。
-            res = conn.execute("SELECT MAX(日期) FROM history_kline").fetchone()[0]
+            res = conn.execute("SELECT MAX(最新日期) FROM kline_status").fetchone()[0]
         except Exception:
             # 捕获表结构损坏等异常情况，防止代码崩溃中断
             res = None
